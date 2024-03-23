@@ -2,11 +2,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "driver/gpio.h"
 #include "sdkconfig.h"
 #if CONFIG_ETH_USE_SPI_ETHERNET
 #include "driver/spi_master.h"
@@ -15,8 +15,12 @@
 
 #ifdef CONFIG_MICRO_ROS_ESP_NETIF_ENET
 
+#define ETHERNET_CONNECTED_BIT BIT0
+#define ETHERNET_FAIL_BIT BIT1
+
 uint8_t IP_ADDRESS[4];
 
+static EventGroupHandle_t s_ethernet_event_group;
 static const char *TAG = "eth_interface";
 
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
@@ -26,7 +30,8 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
     /* we can get the ethernet driver handle from event data */
     esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
 
-    switch (event_id) {
+    switch (event_id)
+    {
     case ETHERNET_EVENT_CONNECTED:
         esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
         ESP_LOGI(TAG, "Ethernet Link Up");
@@ -35,12 +40,14 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "Ethernet Link Down");
+        xEventGroupSetBits(s_ethernet_event_group, ETHERNET_FAIL_BIT);
         break;
     case ETHERNET_EVENT_START:
         ESP_LOGI(TAG, "Ethernet Started");
         break;
     case ETHERNET_EVENT_STOP:
         ESP_LOGI(TAG, "Ethernet Stopped");
+        xEventGroupSetBits(s_ethernet_event_group, ETHERNET_FAIL_BIT);
         break;
     default:
         break;
@@ -50,7 +57,7 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
                                  int32_t event_id, void *event_data)
 {
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
 
     ESP_LOGI(TAG, "Ethernet Got IP Address");
@@ -64,18 +71,24 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     IP_ADDRESS[1] = esp_ip4_addr_get_byte(&event->ip_info.ip, 1);
     IP_ADDRESS[2] = esp_ip4_addr_get_byte(&event->ip_info.ip, 2);
     IP_ADDRESS[3] = esp_ip4_addr_get_byte(&event->ip_info.ip, 3);
+
+    xEventGroupSetBits(s_ethernet_event_group, ETHERNET_CONNECTED_BIT);
 }
 
+#define PIN_PHY_POWER GPIO_NUM_12
 esp_err_t uros_network_interface_initialize(void)
 {
+    s_ethernet_event_group = xEventGroupCreate();
+
     // Initialize TCP/IP network interface (should be called only once in application)
     ESP_ERROR_CHECK(esp_netif_init());
     // Create default event loop that running in background
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t *eth_netif = esp_netif_new(&cfg);
+
     // Set default handlers to process TCP/IP stuffs
-    ESP_ERROR_CHECK(esp_eth_set_default_handlers(eth_netif));
+    // ESP_ERROR_CHECK(esp_eth_set_default_handlers(eth_netif));
     // Register user defined event handers
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
@@ -85,15 +98,19 @@ esp_err_t uros_network_interface_initialize(void)
     phy_config.phy_addr = CONFIG_MICRO_ROS_ETH_PHY_ADDR;
     phy_config.reset_gpio_num = CONFIG_MICRO_ROS_ETH_PHY_RST_GPIO;
 #if CONFIG_MICRO_ROS_USE_INTERNAL_ETHERNET
-    mac_config.smi_mdc_gpio_num = CONFIG_MICRO_ROS_ETH_MDC_GPIO;
-    mac_config.smi_mdio_gpio_num = CONFIG_MICRO_ROS_ETH_MDIO_GPIO;
-    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&mac_config);
+    // Init MAC and PHY configs to default
+    eth_esp32_emac_config_t emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    mac_config.sw_reset_timeout_ms = 250; // Needed for some ethernet controllers to initiate
+
+    emac_config.smi_mdc_gpio_num = CONFIG_MICRO_ROS_ETH_MDC_GPIO;
+    emac_config.smi_mdio_gpio_num = CONFIG_MICRO_ROS_ETH_MDIO_GPIO;
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&emac_config, &mac_config);
 #if CONFIG_MICRO_ROS_ETH_PHY_IP101
     esp_eth_phy_t *phy = esp_eth_phy_new_ip101(&phy_config);
 #elif CONFIG_MICRO_ROS_ETH_PHY_RTL8201
     esp_eth_phy_t *phy = esp_eth_phy_new_rtl8201(&phy_config);
 #elif CONFIG_MICRO_ROS_ETH_PHY_LAN8720
-    esp_eth_phy_t *phy = esp_eth_phy_new_lan8720(&phy_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
 #elif CONFIG_MICRO_ROS_ETH_PHY_DP83848
     esp_eth_phy_t *phy = esp_eth_phy_new_dp83848(&phy_config);
 #elif CONFIG_MICRO_ROS_ETH_PHY_KSZ8041
@@ -117,8 +134,7 @@ esp_err_t uros_network_interface_initialize(void)
         .mode = 0,
         .clock_speed_hz = CONFIG_MICRO_ROS_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num = CONFIG_MICRO_ROS_ETH_SPI_CS_GPIO,
-        .queue_size = 20
-    };
+        .queue_size = 20};
     ESP_ERROR_CHECK(spi_bus_add_device(CONFIG_MICRO_ROS_ETH_SPI_HOST, &devcfg, &spi_handle));
     /* dm9051 ethernet driver is based on spi driver */
     eth_dm9051_config_t dm9051_config = ETH_DM9051_DEFAULT_CONFIG(spi_handle);
@@ -132,8 +148,7 @@ esp_err_t uros_network_interface_initialize(void)
         .mode = 0,
         .clock_speed_hz = CONFIG_MICRO_ROS_ETH_SPI_CLOCK_MHZ * 1000 * 1000,
         .spics_io_num = CONFIG_MICRO_ROS_ETH_SPI_CS_GPIO,
-        .queue_size = 20
-    };
+        .queue_size = 20};
     ESP_ERROR_CHECK(spi_bus_add_device(CONFIG_MICRO_ROS_ETH_SPI_HOST, &devcfg, &spi_handle));
     /* w5500 ethernet driver is based on spi driver */
     eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(spi_handle);
@@ -149,14 +164,38 @@ esp_err_t uros_network_interface_initialize(void)
     /* The SPI Ethernet module might doesn't have a burned factory MAC address, we cat to set it manually.
        02:00:00 is a Locally Administered OUI range so should not be used except when testing on a LAN under your control.
     */
-    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, (uint8_t[]) {
-        0x02, 0x00, 0x00, 0x12, 0x34, 0x56
-    }));
+    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x56}));
 #endif
     /* attach Ethernet driver to TCP/IP stack */
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
     /* start Ethernet driver state machine */
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
+     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    EventBits_t bits = xEventGroupWaitBits(s_ethernet_event_group,
+                                           ETHERNET_CONNECTED_BIT | ETHERNET_FAIL_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           portMAX_DELAY);
+
+    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
+     * happened. */
+    if (bits & ETHERNET_CONNECTED_BIT)
+    {
+        ESP_LOGI(TAG, "Connected to network via ethernet.");
+        return ESP_OK;
+    }
+    else if (bits & ETHERNET_FAIL_BIT)
+    {
+        ESP_LOGI(TAG, "Connection to network via ethernet failed.");
+        return ESP_FAIL;
+    }
+    else
+    {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        return ESP_FAIL;
+    }
 
     return ESP_OK;
 }
